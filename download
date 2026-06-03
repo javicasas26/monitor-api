@@ -1,0 +1,66 @@
+const fetch = require('node-fetch');
+
+async function readSheet({ sheetUrl, sheetName, headerRow, skuKeyword, solKeyword }) {
+  const apiKey = process.env.GOOGLE_API_KEY;
+  if (!apiKey) throw new Error('GOOGLE_API_KEY no configurada');
+  const sheetId = extractSheetId(sheetUrl);
+  if (!sheetId) throw new Error('URL de Google Sheets inválida');
+
+  const range = encodeURIComponent(`${sheetName}!A1:Z5000`);
+  const res   = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${range}?key=${apiKey}`);
+  const data  = await res.json();
+  if (data.error) throw new Error(`Google Sheets API: ${data.error.message}`);
+
+  const values  = data.values || [];
+  const hIdx    = (headerRow || 2) - 1;
+  const headers = (values[hIdx] || []).map(c => String(c||'').trim());
+  const skuKw   = (skuKeyword  || 'Sku').toLowerCase();
+  const solKw   = (solKeyword  || 'Solicitud').toLowerCase();
+
+  let skuColIdx = -1, solColIdx = -1;
+  headers.forEach((h,i) => {
+    const v = h.toLowerCase();
+    if (skuColIdx < 0 && v.includes(skuKw)) skuColIdx = i;
+    if (solColIdx < 0 && v.includes(solKw)) solColIdx = i;
+  });
+
+  const rows = values.slice(hIdx+1).map((row,i) => {
+    const sku = skuColIdx >= 0 ? String(row[skuColIdx]||'').trim() : '';
+    const sol = solColIdx >= 0 ? String(row[solColIdx]||'').trim() : '';
+    const cells = {};
+    headers.forEach((name,ci) => { if(name) cells[name] = String(row[ci]||'').trim(); });
+    return { rowNum: hIdx+2+i, sku, solicitud: sol, cells };
+  }).filter(r => r.sku || r.solicitud);
+
+  return { headerNames: headers, skuColIdx, solColIdx, rows };
+}
+
+function computeDiff(currentRows, snapshotRows, solColName) {
+  const snapMap = {};
+  (snapshotRows||[]).forEach(r => { if(r.sku) snapMap[r.sku] = r; });
+  const currMap = {};
+  currentRows.forEach(r => { if(r.sku) currMap[r.sku] = r; });
+  const allSkus = new Set([...Object.keys(snapMap), ...Object.keys(currMap)]);
+  const changes = [];
+  allSkus.forEach(sku => {
+    const prev = snapMap[sku], curr = currMap[sku];
+    if (!prev && curr) { changes.push({ sku, rowNum: curr.rowNum, changeType:'new', solicitud: curr.solicitud, diffs:[] }); return; }
+    if (prev && !curr) { changes.push({ sku, rowNum: prev.rowNum, changeType:'deleted', solicitud:'', diffs:[] }); return; }
+    const diffs = [];
+    new Set([...Object.keys(prev.cells||{}), ...Object.keys(curr.cells||{})]).forEach(col => {
+      const vP = String(prev.cells?.[col]||'').trim();
+      const vC = String(curr.cells?.[col] ||'').trim();
+      if (vP !== vC) diffs.push({ col, before:vP, after:vC });
+    });
+    if (!diffs.length) return;
+    const hasSol = diffs.some(d => d.col === solColName);
+    const hasOth = diffs.some(d => d.col !== solColName);
+    changes.push({ sku, rowNum: curr.rowNum, changeType: hasSol&&!hasOth?'solicitud':'modified', solicitud: curr.solicitud, diffs });
+  });
+  return changes;
+}
+
+function extractSheetId(url) { const m = String(url).match(/\/d\/([a-zA-Z0-9_-]+)/); return m?m[1]:null; }
+function clientId(url) { let h=0; for(const c of String(url)) h=(Math.imul(31,h)+c.charCodeAt(0))|0; return 'cl_'+Math.abs(h).toString(36); }
+
+module.exports = { readSheet, computeDiff, clientId };
